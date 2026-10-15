@@ -1,0 +1,228 @@
+{
+  "name": "Agentic AI - Real-Time Industrial Energy Optimization and Fault Monitoring",
+  "nodes": [
+    {
+      "name": "Read Me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {
+        "content": "## Agentic AI Industrial Monitoring\n\nFlow 1 (top): Sensors -> Edge fault detection -> Agentic AI analysis -> Telegram chatbot alert + log.\nFlow 2 (bottom): Operator chatbot (live values, fault explanation, recommendations, energy queries).\n\nSETUP: add OpenAI credential to both chat model nodes. Telegram and Google Sheets are optional. Activate the workflow so history is stored for the chatbot.",
+        "height": 200,
+        "width": 620
+      }
+    },
+    {
+      "name": "Every Minute (Simulated ESP32)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [64, 272],
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 1 }] }
+      }
+    },
+    {
+      "name": "ESP32 HTTP Telemetry",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [64, 464],
+      "webhookId": "sensor-data-hook",
+      "parameters": { "httpMethod": "POST", "path": "sensor-data", "options": {} }
+    },
+    {
+      "name": "Read Sensors",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 368],
+      "parameters": {
+        "jsCode": "const first = $input.all()[0].json;\nif (first.body && first.body.light_voltage !== undefined) {\n  return [{ json: { ...first.body, timestamp: first.body.timestamp || new Date().toISOString(), source: 'esp32' } }];\n}\nconst r = (a, b) => a + Math.random() * (b - a);\nconst list = ['normal','normal','normal','normal','low_voltage','high_voltage','interruption','overcurrent','overheating','gas_leak'];\nconst scen = list[Math.floor(Math.random() * list.length)];\nconst d = { light_voltage: r(226, 232), fan_voltage: r(227, 233), temperature_c: r(32, 37), gas_ppm: r(20, 60), current_a: r(2.5, 4.5) };\nif (scen === 'low_voltage') d.light_voltage = r(180, 200);\nif (scen === 'high_voltage') d.fan_voltage = r(256, 268);\nif (scen === 'interruption') { d.light_voltage = r(0, 10); d.fan_voltage = r(0, 10); d.current_a = 0; }\nif (scen === 'overcurrent') d.current_a = r(11, 16);\nif (scen === 'overheating') d.temperature_c = r(62, 75);\nif (scen === 'gas_leak') d.gas_ppm = r(350, 800);\nObject.keys(d).forEach(k => { d[k] = +d[k].toFixed(1); });\nreturn [{ json: { ...d, timestamp: new Date().toISOString(), source: 'simulator', simulated_scenario: scen } }];"
+      }
+    },
+    {
+      "name": "Edge Processing and Fault Detection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [592, 368],
+      "parameters": {
+        "jsCode": "const sd = $getWorkflowStaticData('global');\nsd.history = sd.history || [];\nsd.events = sd.events || [];\nconst d = $input.first().json;\nconst prev = sd.history[sd.history.length - 1];\nconst faults = [];\nconst add = (type, sev, detail) => faults.push({ type, severity: sev, detail });\nconst LOW = 207, HIGH = 253;\n[['Light', d.light_voltage], ['Fan', d.fan_voltage]].forEach(([n, v]) => {\n  if (v < 50) add('POWER_INTERRUPTION', 'critical', n + ' voltage collapsed to ' + v + ' V');\n  else if (v < LOW) add('LOW_VOLTAGE', 'medium', n + ' voltage ' + v + ' V is below ' + LOW + ' V');\n  else if (v > HIGH) add('HIGH_VOLTAGE', 'medium', n + ' voltage ' + v + ' V is above ' + HIGH + ' V');\n});\nif (prev) {\n  ['light_voltage', 'fan_voltage'].forEach(k => {\n    const delta = Math.abs(d[k] - prev[k]);\n    if (delta > 30 && d[k] >= 50 && prev[k] >= 50) add('POWER_DISTURBANCE', 'medium', k + ' changed by ' + delta.toFixed(1) + ' V in one interval');\n  });\n}\nif (d.current_a > 10) add('ABNORMAL_CURRENT', 'high', 'Load current ' + d.current_a + ' A exceeds 10 A limit');\nif (d.temperature_c > 60) add('HIGH_TEMPERATURE', 'critical', 'Temperature ' + d.temperature_c + ' C exceeds 60 C');\nelse if (d.temperature_c > 45) add('HIGH_TEMPERATURE', 'high', 'Temperature ' + d.temperature_c + ' C exceeds 45 C');\nif (d.gas_ppm > 600) add('GAS_LEAK', 'critical', 'Gas level ' + d.gas_ppm + ' ppm exceeds 600 ppm');\nelse if (d.gas_ppm > 300) add('GAS_LEAK', 'high', 'Gas level ' + d.gas_ppm + ' ppm exceeds 300 ppm');\nconst rank = { medium: 1, high: 2, critical: 3 };\nlet top = faults.reduce((m, f) => Math.max(m, rank[f.severity]), 0);\nif (faults.length >= 2 && top < 3) top += 1;\nconst severity = ['normal', 'medium', 'high', 'critical'][top];\nconst power_kw = +(d.fan_voltage * d.current_a * 0.9 / 1000).toFixed(3);\nsd.history.push({ ts: d.timestamp, light_voltage: d.light_voltage, fan_voltage: d.fan_voltage, temperature_c: d.temperature_c, gas_ppm: d.gas_ppm, current_a: d.current_a, power_kw, faults: faults.map(f => f.type) });\nif (sd.history.length > 120) sd.history.shift();\nconst h = sd.history;\nlet run = 0;\nfor (let i = h.length - 1; i >= 0; i--) { if (h[i].current_a > 0.5) run++; else break; }\nconst total = h.reduce((s, x) => s + x.power_kw, 0);\nsd.energy = { samples: h.length, avg_power_kw: +(total / h.length).toFixed(3), peak_power_kw: +Math.max(...h.map(x => x.power_kw)).toFixed(3), energy_kwh_window: +(total / 60).toFixed(3), continuous_run_minutes: run, note: run >= 60 ? 'Load has run continuously for over an hour' : '' };\nif (faults.length) { sd.events.push({ ts: d.timestamp, severity, faults: faults.map(f => f.type) }); if (sd.events.length > 50) sd.events.shift(); }\nreturn [{ json: { ...d, power_kw, faults, fault_count: faults.length, severity, abnormal: faults.length > 0 ? 'yes' : 'no', status: faults.length > 0 ? 'FAULT' : 'NORMAL', energy: sd.energy } }];"
+      }
+    },
+    {
+      "name": "Abnormal?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [848, 368],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 1 },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.abnormal }}",
+              "rightValue": "yes",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Normal - Keep Monitoring",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [880, 208],
+      "parameters": {}
+    },
+    {
+      "name": "Agentic AI Analysis",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [1104, 224],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Analyze this fault event from the industrial monitoring system and reply with JSON only.\n\nReading:\n{{ JSON.stringify({ light_voltage: $json.light_voltage, fan_voltage: $json.fan_voltage, temperature_c: $json.temperature_c, gas_ppm: $json.gas_ppm, current_a: $json.current_a, power_kw: $json.power_kw, timestamp: $json.timestamp }) }}\n\nDetected faults:\n{{ JSON.stringify($json.faults) }}\n\nEnergy summary:\n{{ JSON.stringify($json.energy) }}",
+        "options": {
+          "systemMessage": "You are the Agentic AI decision layer of an industrial electrical and environmental monitoring system. Sensors: light voltage, fan voltage (nominal 230 V, normal range 207 to 253 V), temperature (normal below 45 C), leakage gas (normal below 300 ppm), load current (normal below 10 A). Steps: correlate the electrical and environmental signals to reduce false positives, classify the fault and severity (medium, high, critical), infer probable root causes, explain in simple language for an operator, give ranked corrective actions, state any immediate safety action (for gas leak or overheating), and give one energy optimization tip based on the energy summary. Use memory to notice repeated faults. Reply ONLY with valid JSON: {\"severity\":\"\",\"fault_type\":\"\",\"probable_causes\":[\"\"],\"explanation\":\"\",\"recommendations\":[\"\"],\"safety_action\":\"\",\"energy_tip\":\"\"}"
+        }
+      }
+    },
+    {
+      "name": "OpenAI Chat Model (Analysis)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [1040, 448],
+      "parameters": {
+        "model": { "__rl": true, "value": "gpt-4o-mini", "mode": "list", "cachedResultName": "gpt-4o-mini" },
+        "options": { "temperature": 0.2 }
+      }
+    },
+    {
+      "name": "Fault History Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [1232, 448],
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "industrial-plant-fault-history",
+        "contextWindowLength": 10
+      }
+    },
+    {
+      "name": "Format Chatbot Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1472, 224],
+      "parameters": {
+        "jsCode": "const src = $('Edge Processing and Fault Detection').first().json;\nconst raw = String($input.first().json.output || '');\nlet a;\ntry {\n  a = JSON.parse(raw.replace(/```json|```/g, '').trim());\n} catch (e) {\n  a = { severity: src.severity, fault_type: src.faults.map(f => f.type).join(', '), probable_causes: [], explanation: raw, recommendations: [], safety_action: '', energy_tip: '' };\n}\nconst list = x => Array.isArray(x) ? x.map((t, i) => (i + 1) + '. ' + t).join('\\n') : String(x || '');\nconst title = String(a.fault_type || 'FAULT').replace(/_/g, ' ').toUpperCase();\nconst message = 'ALERT [' + String(a.severity || src.severity).toUpperCase() + '] ' + title + ' DETECTED\\n\\n' +\n  'Light Voltage: ' + src.light_voltage + ' V | Fan Voltage: ' + src.fan_voltage + ' V | Temperature: ' + src.temperature_c + ' C | Gas: ' + src.gas_ppm + ' ppm | Current: ' + src.current_a + ' A\\n\\n' +\n  'Explanation: ' + a.explanation + '\\n\\n' +\n  'Probable causes:\\n' + list(a.probable_causes) + '\\n\\n' +\n  'Recommended actions:\\n' + list(a.recommendations) + '\\n\\n' +\n  (a.safety_action ? 'Safety action: ' + a.safety_action + '\\n\\n' : '') +\n  'Energy tip: ' + (a.energy_tip || 'None');\nreturn [{ json: {\n  timestamp: src.timestamp,\n  severity: a.severity || src.severity,\n  fault_type: a.fault_type,\n  light_voltage: src.light_voltage,\n  fan_voltage: src.fan_voltage,\n  temperature_c: src.temperature_c,\n  gas_ppm: src.gas_ppm,\n  current_a: src.current_a,\n  power_kw: src.power_kw,\n  explanation: a.explanation,\n  recommendations: Array.isArray(a.recommendations) ? a.recommendations.join('; ') : a.recommendations,\n  energy_tip: a.energy_tip,\n  alert_message: message\n} }];"
+      }
+    },
+    {
+      "name": "Telegram Chatbot Alert (Optional)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1728, 128],
+      "webhookId": "telegram-alert-hook",
+      "parameters": {
+        "chatId": "REPLACE_WITH_YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ $('Agentic AI Analysis').item.json.output }}",
+        "replyMarkup": "forceReply",
+        "forceReply": {},
+        "additionalFields": {}
+      }
+    },
+    {
+      "name": "Store Event Log (Optional)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1728, 320],
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "id", "value": "REPLACE_WITH_GOOGLE_SHEET_ID" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "FaultLog" },
+        "columns": { "mappingMode": "autoMapInputData", "value": {}, "matchingColumns": [], "schema": [] },
+        "options": {}
+      }
+    },
+    {
+      "name": "Operator Chatbot",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [64, 784],
+      "webhookId": "operator-chatbot-hook",
+      "parameters": { "options": {} }
+    },
+    {
+      "name": "Load Live System State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 784],
+      "parameters": {
+        "jsCode": "const sd = $getWorkflowStaticData('global');\nconst h = sd.history || [];\nconst latest = h.length ? h[h.length - 1] : null;\nconst chat = $input.first().json;\nconst context = {\n  latest_reading: latest,\n  system_status: latest ? (latest.faults.length ? 'FAULT: ' + latest.faults.join(', ') : 'NORMAL') : 'NO DATA YET',\n  recent_fault_events: (sd.events || []).slice(-5),\n  last_10_readings: h.slice(-10),\n  energy_summary: sd.energy || null,\n  thresholds: { voltage_v: '207 to 253', temperature_c: 'below 45', gas_ppm: 'below 300', current_a: 'below 10' }\n};\nreturn [{ json: { chatInput: chat.chatInput, sessionId: chat.sessionId, context: JSON.stringify(context) } }];"
+      }
+    },
+    {
+      "name": "Chatbot Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [592, 784],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Operator question: {{ $json.chatInput }}\n\nLive system data (JSON):\n{{ $json.context }}",
+        "options": {
+          "systemMessage": "You are the AI chatbot of an industrial energy optimization and fault monitoring system. You help operators with: live values, fault alerts, fault explanations, recommendations, monitoring queries, and energy optimization. Use only the live system data provided; never invent readings. If the data says NO DATA YET, tell the operator to activate the workflow and wait a couple of minutes. For a status request, answer in this style: SYSTEM STATUS: NORMAL - Light Voltage: 228 V, Fan Voltage: 231 V, Temperature: 34 C, Gas Status: Normal. For faults, state what was detected, likely causes, and ranked next-step checks. For energy questions, use the energy summary to point out continuous operation, peaks, and scheduling or load-shedding savings. Give safety-critical warnings first (gas leak, overheating, power interruption). Keep answers short and clear."
+        }
+      }
+    },
+    {
+      "name": "OpenAI Chat Model (Chatbot)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [528, 1008],
+      "parameters": {
+        "model": { "__rl": true, "value": "gpt-4o-mini", "mode": "list", "cachedResultName": "gpt-4o-mini" },
+        "options": { "temperature": 0.3 }
+      }
+    },
+    {
+      "name": "Chat Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [704, 1008],
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.sessionId }}",
+        "contextWindowLength": 8
+      }
+    }
+  ],
+  "connections": {
+    "Every Minute (Simulated ESP32)": { "main": [[{ "node": "Read Sensors", "type": "main", "index": 0 }]] },
+    "ESP32 HTTP Telemetry": { "main": [[{ "node": "Read Sensors", "type": "main", "index": 0 }]] },
+    "Read Sensors": { "main": [[{ "node": "Edge Processing and Fault Detection", "type": "main", "index": 0 }]] },
+    "Edge Processing and Fault Detection": { "main": [[{ "node": "Abnormal?", "type": "main", "index": 0 }]] },
+    "Abnormal?": {
+      "main": [
+        [{ "node": "Agentic AI Analysis", "type": "main", "index": 0 }],
+        [{ "node": "Normal - Keep Monitoring", "type": "main", "index": 0 }]
+      ]
+    },
+    "OpenAI Chat Model (Analysis)": { "ai_languageModel": [[{ "node": "Agentic AI Analysis", "type": "ai_languageModel", "index": 0 }]] },
+    "Fault History Memory": { "ai_memory": [[{ "node": "Agentic AI Analysis", "type": "ai_memory", "index": 0 }]] },
+    "Agentic AI Analysis": { "main": [[{ "node": "Format Chatbot Alert", "type": "main", "index": 0 }]] },
+    "Format Chatbot Alert": {
+      "main": [
+        [
+          { "node": "Telegram Chatbot Alert (Optional)", "type": "main", "index": 0 },
+          { "node": "Store Event Log (Optional)", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Operator Chatbot": { "main": [[{ "node": "Load Live System State", "type": "main", "index": 0 }]] },
+    "Load Live System State": { "main": [[{ "node": "Chatbot Agent", "type": "main", "index": 0 }]] },
+    "OpenAI Chat Model (Chatbot)": { "ai_languageModel": [[{ "node": "Chatbot Agent", "type": "ai_languageModel", "index": 0 }]] },
+    "Chat Memory": { "ai_memory": [[{ "node": "Chatbot Agent", "type": "ai_memory", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}
